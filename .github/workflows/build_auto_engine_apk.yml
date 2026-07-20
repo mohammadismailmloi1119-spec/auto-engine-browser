@@ -102,6 +102,7 @@ jobs:
 
       - name: Run Chromium hooks (installs NDK, SDK, etc.)
         working-directory: /mnt/chromium
+        continue-on-error: true   # traffic_annotation_auditor hook fails on stale GCS URL; it is not needed for APK builds
         run: |
           export DEPOT_TOOLS_UPDATE=0
           gclient runhooks
