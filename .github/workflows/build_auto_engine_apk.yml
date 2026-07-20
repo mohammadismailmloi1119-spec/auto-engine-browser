@@ -84,14 +84,13 @@ jobs:
         working-directory: /mnt/chromium
         run: |
           # gclient config must be run in the directory that will CONTAIN src/
-          # target_os="android" is required so gclient fetches the Android
-          # native toolchain support (NDK etc.) that gn gen expects.
           gclient config --name src \
-            --custom-var "target_os=[\"android\"]" \
             "https://chromium.googlesource.com/chromium/src.git"
-          # Append target_os to .gclient (the --custom-var route doesn't always work)
+          # target_os="android" is required so the Android native toolchain
+          # (NDK etc.) is fetched and gn gen succeeds.
+          # --custom-var cannot take list values, so we append directly.
           echo 'target_os = ["android"]' >> /mnt/chromium/.gclient
-          # Verify .gclient was created
+          # Verify
           cat /mnt/chromium/.gclient
 
       - name: Fetch Chromium source — no history, pinned revision
