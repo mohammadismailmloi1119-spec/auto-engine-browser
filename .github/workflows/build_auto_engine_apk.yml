@@ -1,0 +1,220 @@
+# AUTO ENGINE Browser — Self-contained build & sign workflow
+# This workflow fetches the full Chromium source, overlays the AUTO ENGINE
+# patches, compiles arm64 only (largest user-base), signs with a
+# freshly-generated key, and publishes the APK to GitHub Releases.
+#
+# ⚠️  A full Chromium build needs ~80 GB disk and ~6 h of CPU.
+#     Standard GitHub-hosted runners (14 GB SSD) will run out of space.
+#     Use a self-hosted runner with ≥100 GB free disk, or enable the
+#     "large-runner" option in your repository if you have it.
+#     On a standard runner the build will fail at the "fetch src" step
+#     with a disk-full error — this is expected, not a code bug.
+
+name: "AUTO ENGINE: Build & Sign APK"
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Target CPU architecture"
+        required: true
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - arm
+          - x64
+          - x86
+
+jobs:
+  build:
+    runs-on: ubuntu-latest   # swap for self-hosted if you have one
+
+    env:
+      TARGET_CPU: ${{ github.event.inputs.platform || 'arm64' }}
+      OUT_DIR:    out/android_${{ github.event.inputs.platform || 'arm64' }}
+
+    steps:
+      # ── Disk preparation ────────────────────────────────────────────────
+      - name: Free up disk space
+        run: |
+          sudo swapoff -av
+          sudo rm -rf /swapfile \
+                      /usr/share/dotnet \
+                      /usr/local/lib/android \
+                      /opt/ghc \
+                      /usr/share/swift
+          df -h
+
+      - name: Mount extra space at /mnt/chromium
+        run: |
+          sudo mkdir -p /mnt/chromium
+          sudo chown $USER /mnt/chromium
+
+      # ── Checkout AUTO ENGINE overlay ─────────────────────────────────────
+      - name: Checkout AUTO ENGINE source overlay
+        uses: actions/checkout@v4
+        with:
+          path: auto-engine-overlay
+
+      # ── Toolchain ────────────────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            python3 python3-pip python-is-python3 \
+            curl git lsb-release \
+            openjdk-11-jdk-headless \
+            ccache jq
+
+      - name: Install depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git /mnt/chromium/depot_tools
+          echo "/mnt/chromium/depot_tools" >> $GITHUB_PATH
+
+      # ── Fetch Chromium source ────────────────────────────────────────────
+      - name: Read Chromium version from overlay
+        id: chromium_ver
+        run: |
+          source auto-engine-overlay/CHROMIUM_VERSION
+          echo "major=$CHROMIUM_MAJOR" >> $GITHUB_OUTPUT
+          echo "ref=$CHROMIUM_MAJOR.$CHROMIUM_MINOR.$CHROMIUM_BUILD.$CHROMIUM_PATCH" >> $GITHUB_OUTPUT
+
+      - name: Configure gclient
+        working-directory: /mnt/chromium
+        run: |
+          mkdir src
+          cd src
+          gclient config --name src \
+            "https://chromium.googlesource.com/chromium/src.git@${{ steps.chromium_ver.outputs.ref }}"
+
+      - name: Fetch Chromium source (Android, no history)
+        working-directory: /mnt/chromium
+        run: |
+          export DEPOT_TOOLS_UPDATE=0
+          gclient sync \
+            --nohooks \
+            --no-history \
+            --revision="${{ steps.chromium_ver.outputs.ref }}" \
+            -D
+        timeout-minutes: 240
+
+      - name: Run Chromium hooks
+        working-directory: /mnt/chromium/src
+        run: |
+          gclient runhooks
+        timeout-minutes: 60
+
+      # ── Overlay AUTO ENGINE patches ──────────────────────────────────────
+      - name: Overlay AUTO ENGINE source on top of Chromium
+        run: |
+          # rsync overlay over Chromium source (preserving Chromium files not in overlay)
+          rsync -av --exclude='.git' \
+            auto-engine-overlay/ \
+            /mnt/chromium/src/
+          echo "Overlay applied."
+
+      # ── Configure build ──────────────────────────────────────────────────
+      - name: Generate keystore for APK signing
+        run: |
+          keytool -genkey -v \
+            -keystore keystore.jks \
+            -alias dev \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass public_password \
+            -keypass  public_password \
+            -dname "cn=AUTO ENGINE, ou=Actions, o=AUTO ENGINE Browser, c=GitHub"
+          cp keystore.jks /mnt/chromium/src/
+
+      - name: Write GN args
+        run: |
+          mkdir -p /mnt/chromium/src/${{ env.OUT_DIR }}
+          cat /mnt/chromium/src/.build/production_build_reference/args.gn \
+            | sed "s/target_cpu = \"arm64\"/target_cpu = \"${{ env.TARGET_CPU }}\"/" \
+            > /mnt/chromium/src/${{ env.OUT_DIR }}/args.gn
+          echo "--- args.gn ---"
+          cat /mnt/chromium/src/${{ env.OUT_DIR }}/args.gn
+
+      - name: Generate build files with GN
+        working-directory: /mnt/chromium/src
+        run: gn gen ${{ env.OUT_DIR }}
+
+      # ── Compile ──────────────────────────────────────────────────────────
+      - name: Configure ccache
+        run: |
+          ccache --max-size=10G
+          ccache --zero-stats
+
+      - name: Build ChromePublic.apk
+        working-directory: /mnt/chromium/src
+        run: |
+          autoninja -C ${{ env.OUT_DIR }} chrome_public_apk
+        timeout-minutes: 360
+
+      # ── Sign ─────────────────────────────────────────────────────────────
+      - name: Find and sign APK
+        working-directory: /mnt/chromium/src
+        run: |
+          APK_IN="${{ env.OUT_DIR }}/apks/ChromePublic.apk"
+          APK_OUT="${{ env.OUT_DIR }}/apks/AUTO_ENGINE_${{ env.TARGET_CPU }}_${{ github.run_id }}.apk"
+
+          # Align
+          zipalign -v -p 4 "$APK_IN" "${APK_IN%.apk}-aligned.apk"
+
+          # Sign
+          apksigner sign \
+            --ks keystore.jks \
+            --ks-key-alias dev \
+            --ks-pass pass:public_password \
+            --key-pass pass:public_password \
+            --out "$APK_OUT" \
+            "${APK_IN%.apk}-aligned.apk"
+
+          echo "APK_PATH=$APK_OUT" >> $GITHUB_ENV
+          echo "Signed APK: $APK_OUT"
+          ls -lh "$APK_OUT"
+
+      # ── Upload artifact ──────────────────────────────────────────────────
+      - name: Upload signed APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AUTO_ENGINE_${{ env.TARGET_CPU }}_apk
+          path: /mnt/chromium/src/${{ env.APK_PATH }}
+
+      # ── Publish release ──────────────────────────────────────────────────
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name:     "build-${{ github.run_id }}"
+          release_name: "AUTO ENGINE build ${{ github.run_id }} (${{ env.TARGET_CPU }})"
+          draft:        false
+          prerelease:   true
+          body: |
+            AUTO ENGINE Browser — automated build
+
+            Architecture : **${{ env.TARGET_CPU }}**
+            Chromium base: ${{ steps.chromium_ver.outputs.ref }}
+            Run ID       : ${{ github.run_id }}
+            Triggered by : ${{ github.actor }}
+
+            > ⚠️ This APK is signed with a one-time GitHub Actions key.
+            > It cannot be verified against a developer certificate — install at your own discretion.
+
+      - name: Upload APK to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url:        ${{ steps.create_release.outputs.upload_url }}
+          asset_path:        /mnt/chromium/src/${{ env.APK_PATH }}
+          asset_name:        AUTO_ENGINE_${{ env.TARGET_CPU }}_${{ github.run_id }}.apk
+          asset_content_type: application/vnd.android.package-archive
+
+      - name: Print download link
+        run: |
+          echo "✅ Release: https://github.com/${{ github.repository }}/releases/tag/build-${{ github.run_id }}"
